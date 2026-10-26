@@ -1,0 +1,134 @@
+import time
+import MetaTrader5 as mt5
+import pandas as pd
+
+# --- PARÁMETROS DE GESTIÓN DE RIESGO ($2 DE MARGEN) ---
+SIMBOLO = "Crash 500"        
+VOLUMEN_LOTE = 0.20          
+MAX_OPERACIONES = 1          
+
+GANANCIA_META_USD = 0.50     # Cierre al atrapar el spike (ganancia por operación)
+PERDIDA_MAX_USD = -2.00      # 🛑 Margen de pérdida estricto: Si llega a -$2, se corta.
+TIEMPO_MAX_VIDA_SEG = 35     # Seguridad por tiempo
+
+def inicializar_mt5():
+    if not mt5.initialize():
+        print(f"❌ Error MT5: {mt5.last_error()}")
+        quit()
+    
+    symbol_info = mt5.symbol_info(SIMBOLO)
+    if symbol_info is None or not mt5.symbol_select(SIMBOLO, True):
+        print(f"❌ Error: El símbolo {SIMBOLO} no está disponible.")
+        mt5.shutdown()
+        quit()
+            
+    print(f"⚡ BOT CAZADOR DE SPIKES ACTIVADO ({SIMBOLO})")
+    print(f"🛡️ Margen de riesgo por operación: ${abs(PERDIDA_MAX_USD)} | Lote: {VOLUMEN_LOTE}")
+
+def contar_posiciones_abiertas():
+    posiciones = mt5.positions_get(symbol=SIMBOLO)
+    return len(posiciones) if posiciones else 0
+
+def evaluar_patron_accion_precio():
+    rates = mt5.copy_rates_from_pos(SIMBOLO, mt5.TIMEFRAME_M1, 0, 10)
+    if rates is None or len(rates) < 10:
+        return False
+
+    df = pd.DataFrame(rates)
+    df['cuerpo'] = df['close'] - df['open']
+    ultimas_velas_verdes = (df['cuerpo'].tail(4) > 0).sum()
+    
+    # Patrón de acumulación alcista antes de la caída
+    if ultimas_velas_verdes >= 3:
+        return True
+        
+    return False
+
+def gestionar_ordenes_activas():
+    posiciones = mt5.positions_get(symbol=SIMBOLO)
+    if not posiciones:
+        return
+
+    tiempo_actual = time.time()
+    for pos in posiciones:
+        tiempo_abierta = tiempo_actual - pos.time
+        beneficio = pos.profit
+
+        # 1. ¡SPIKE CAZADO EN VERDE!
+        if beneficio >= GANANCIA_META_USD:
+            cerrar_posicion(pos, f"🎯 ¡SPIKE CAZADO! Ganancia: ${beneficio:.2f}")
+            continue
+
+        # 2. 🛑 LÍMITE DE PÉRDIDA ALCANZADO (-$2 DE MARGEN)
+        if beneficio <= PERDIDA_MAX_USD:
+            cerrar_posicion(pos, f"🛑 Stop Loss de $2 alcanzado. Cortando pérdida: ${beneficio:.2f}")
+            continue
+
+        # 3. SALIDA POR TIEMPO DE SEGURIDAD
+        if tiempo_abierta > TIEMPO_MAX_VIDA_SEG:
+            cerrar_posicion(pos, "⏱️ Salida por tiempo (Sin spike rápido)")
+
+def cerrar_posicion(posicion, razon):
+    tick = mt5.symbol_info_tick(SIMBOLO)
+    if tick is None:
+        return
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SIMBOLO,
+        "volume": posicion.volume,
+        "type": mt5.ORDER_TYPE_BUY,  # Compra para cerrar venta
+        "position": posicion.ticket,
+        "price": tick.ask,
+        "deviation": 20,
+        "magic": 888888,
+        "comment": "Cierre Bot",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    resultado = mt5.order_send(request)
+    if resultado.retcode == mt5.TRADE_RETCODE_DONE:
+        print(f"✅ {razon}")
+
+def ejecutar_estrategia():
+    gestionar_ordenes_activas()
+
+    if contar_posiciones_abiertas() >= MAX_OPERACIONES:
+        return
+
+    if evaluar_patron_accion_precio():
+        tick = mt5.symbol_info_tick(SIMBOLO)
+        if tick is None:
+            return
+
+        precio = tick.bid
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": SIMBOLO,
+            "volume": VOLUMEN_LOTE,
+            "type": mt5.ORDER_TYPE_SELL,
+            "price": precio,
+            "deviation": 20,
+            "magic": 888888,
+            "comment": "Venta C500",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        resultado = mt5.order_send(request)
+        if resultado.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"📉 Venta ejecutada a {precio}. Margen de riesgo máximo: $2.")
+
+def main():
+    inicializar_mt5()
+    try:
+        while True:
+            ejecutar_estrategia()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 Bot detenido.")
+        mt5.shutdown()
+
+if __name__ == "__main__":
+    main()
